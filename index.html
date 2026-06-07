@@ -2076,7 +2076,7 @@ async function resetResponses() {
 /* ════════════════════════════════════════
    참여자 화면 미리보기 오버레이 — FEAT-3
 ════════════════════════════════════════ */
-const PV = { selected:[], compareMode:[], avgCache:{} };
+const PV = { selected:[], compareMode:[], avgCache:{}, pollTimer:null };
 
 async function openPreview() {
   if (!S.adminSess) { toast('세션을 먼저 선택해주세요'); return; }
@@ -2109,6 +2109,57 @@ async function openPreview() {
 
   await renderPreviewChart();
   renderPreviewTable();
+
+  // 미리보기 폴링 시작 (결과보기에서 변경한 것 감지)
+  if (PV.pollTimer) clearInterval(PV.pollTimer);
+  PV.pollTimer = setInterval(pvPoll, 3000);
+}
+
+/* 미리보기 폴링 — 결과보기(ar-view)에서 변경한 compare_mode, preview_selected 감지 */
+async function pvPoll() {
+  if (!S.adminSess) return;
+  const { data:sess } = await db.from('sessions')
+    .select('compare_mode, preview_selected')
+    .eq('id', S.adminSess.id).single();
+  if (!sess) return;
+
+  let needChart = false;
+
+  // compare_mode 변경 감지
+  if (sess.compare_mode !== S.adminSess.compare_mode) {
+    S.adminSess.compare_mode = sess.compare_mode;
+    PV.compareMode = (sess.compare_mode || 'none').split(',').filter(m => m && m !== 'none');
+    // 비교 버튼 UI 갱신
+    document.querySelectorAll('.pv-compare-row .cmp-btn').forEach(b => {
+      if (b.dataset.mode === 'none') b.classList.toggle('on', PV.compareMode.length === 0);
+      else b.classList.toggle('on', PV.compareMode.includes(b.dataset.mode));
+    });
+    // 관리자 제어 패널 비교 버튼도 동기화
+    document.querySelectorAll('.ctrl-compare-row .cmp-btn').forEach(b => {
+      if (b.dataset.mode === 'none') b.classList.toggle('on', PV.compareMode.length === 0);
+      else b.classList.toggle('on', PV.compareMode.includes(b.dataset.mode));
+    });
+    needChart = true;
+  }
+
+  // preview_selected 변경 감지
+  if ((sess.preview_selected || '') !== (S.adminSess.preview_selected || '')) {
+    S.adminSess.preview_selected = sess.preview_selected || '';
+    PV.selected = [];
+    const selStr = S.adminSess.preview_selected;
+    if (selStr) {
+      const selIds = selStr.split(',');
+      const rawColors = ['#F97316','#10B981','#6366F1'];
+      selIds.forEach((id, i) => {
+        const idx = S.adminResps.findIndex(r => r.id === id);
+        if (idx >= 0) PV.selected.push({idx, color: rawColors[i] || rawColors[0]});
+      });
+    }
+    renderPreviewTable();
+    needChart = true;
+  }
+
+  if (needChart) await renderPreviewChart();
 }
 
 async function renderPreviewChart() {
@@ -2269,6 +2320,8 @@ async function fetchAvg_admin(mode) {
 }
 
 function closePreview() {
+  // 미리보기 폴링 정지
+  if (PV.pollTimer) { clearInterval(PV.pollTimer); PV.pollTimer = null; }
   const overlay = document.getElementById('preview-overlay');
   overlay.style.display = 'none';
   const canvas = document.getElementById('preview-chart');
