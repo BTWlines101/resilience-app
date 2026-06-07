@@ -511,7 +511,7 @@ body { font-family:var(--font); color:var(--t1); -webkit-font-smoothing:antialia
     <span class="pulse"></span>
     <span id="count-txt">— 명 완료</span>
   </div>
-  <button class="btn btn-ghost" style="max-width:200px;font-size:13px;color:var(--t3);" onclick="pollSession()">결과 다시 확인하기</button>
+  <button class="btn btn-ghost" style="max-width:200px;font-size:13px;color:var(--t3);" onclick="pollSessionTick()">결과 다시 확인하기</button>
 </div>
 
 <!-- RESULT -->
@@ -793,7 +793,7 @@ const COMPARE_COLORS = {
   total:  '#8B5CF6',
 };
 /* ── 개인 선택 색상 ── */
-const PERSON_COLORS = ['#F97316', '#EC4899', '#84CC16'];
+const PERSON_COLORS = ['#F97316', '#10B981', '#6366F1']; // FIX-V1: 선택 참여자 색상 — 세 화면(결과보기·미리보기·참여자) 동일 팔레트로 통일
 
 /* ════════════════════════════════════════
    문항 데이터
@@ -1092,14 +1092,22 @@ async function updateCount() {
 let _pollVisHandler = null;
 function startPolling() {
   stopPolling();
-  S.pollTimer = setInterval(pollSession, 3000);
+  S.pollTimer = setInterval(pollSessionTick, 3000);
   // 모바일 탭 백그라운드 후 복귀 시 즉시 폴링
-  _pollVisHandler = () => { if (document.visibilityState === 'visible') pollSession(); };
+  _pollVisHandler = () => { if (document.visibilityState === 'visible') pollSessionTick(); };
   document.addEventListener('visibilitychange', _pollVisHandler);
 }
 function stopPolling() {
   if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer = null; }
   if (_pollVisHandler) { document.removeEventListener('visibilitychange', _pollVisHandler); _pollVisHandler = null; }
+}
+
+// FIX-W2: 폴링 재진입 방지 — 이전 폴링이 끝나기 전이면 이번 차례는 건너뜀
+let _pollSessionBusy = false;
+async function pollSessionTick() {
+  if (_pollSessionBusy) return;
+  _pollSessionBusy = true;
+  try { await pollSession(); } finally { _pollSessionBusy = false; }
 }
 
 async function pollSession() {
@@ -1270,6 +1278,7 @@ function renderResultChart(my, avgs) {
       data: DOMAINS.map(d => sel.scores?.[d.id]||0),
       borderColor:sel.color, backgroundColor:`rgba(${rgb},.06)`,
       borderWidth:2, pointStyle:'rectRot', pointRadius:4, pointHoverRadius:5,
+      borderDash:[5,3], // FIX-V1: 선택 참여자는 점선 — 결과보기와 동일
       pointBackgroundColor:sel.color,
     });
   });
@@ -1629,11 +1638,12 @@ async function closeSession() {
 async function toggleResults() {
   const s    = S.adminSess;
   const next = !s.results_public;
-  await db.from('sessions').update({results_public:next}).eq('id', s.id);
+  // FIX-W1: 로컬 상태·버튼을 먼저 갱신하고 DB 전송은 뒤에 — 연타 시 옛 상태를 읽는 문제 방지
   s.results_public = next;
   const btn = document.getElementById('btn-results');
   btn.textContent = next ? '결과공개됨 ✓' : '결과 공개';
   btn.className   = `ctrl-act-btn ${next ? 'ctrl-act-on' : 'ctrl-act-off'}`;
+  await db.from('sessions').update({results_public:next}).eq('id', s.id);
   toast(next ? '결과가 공개되었습니다' : '결과 공개를 취소했습니다');
 }
 async function setCompare(mode) {
@@ -1646,12 +1656,13 @@ async function setCompare(mode) {
     if (idx >= 0) cur.splice(idx, 1); else cur.push(mode);
   }
   const next = cur.length ? cur.join(',') : 'none';
-  await db.from('sessions').update({compare_mode:next}).eq('id', S.adminSess.id);
+  // FIX-W1: 로컬 상태·버튼을 먼저 갱신하고 DB 전송은 뒤에 — 연타 시 옛 상태를 읽는 문제 방지
   S.adminSess.compare_mode = next;
   document.querySelectorAll('.pv-compare-row .cmp-btn').forEach(b => {
     if (b.dataset.mode === 'none') b.classList.toggle('on', cur.length === 0);
     else b.classList.toggle('on', cur.includes(b.dataset.mode));
   });
+  await db.from('sessions').update({compare_mode:next}).eq('id', S.adminSess.id);
   const labels = {day:'오늘', branch:'지사', total:'중부'};
   if (cur.length === 0) toast('비교 그래프를 껐습니다');
   else toast(`비교: ${cur.map(m => labels[m]).join(', ')}`);
@@ -1659,11 +1670,12 @@ async function setCompare(mode) {
 async function toggleGuide() {
   const s    = S.adminSess;
   const next = !s.guide_public;
-  await db.from('sessions').update({guide_public:next}).eq('id', s.id);
+  // FIX-W1: 로컬 상태·버튼을 먼저 갱신하고 DB 전송은 뒤에 — 연타 시 옛 상태를 읽는 문제 방지
   s.guide_public = next;
   const btn = document.getElementById('btn-guide-pub');
   btn.textContent = next ? '해석공개됨 ✓' : '해석 공개';
   btn.className   = `ctrl-act-btn ${next ? 'ctrl-act-on' : 'ctrl-act-off'}`;
+  await db.from('sessions').update({guide_public:next}).eq('id', s.id);
   toast(next ? '해석자료가 공개되었습니다' : '해석자료 공개를 취소했습니다');
 }
 
@@ -1987,7 +1999,15 @@ let _arPollTimer = null;
 
 function arStartPolling() {
   if (_arPollTimer) clearInterval(_arPollTimer);
-  _arPollTimer = setInterval(arPoll, 5000);
+  _arPollTimer = setInterval(arPollTick, 5000);
+}
+
+// FIX-W2: 폴링 재진입 방지
+let _arPollBusy = false;
+async function arPollTick() {
+  if (_arPollBusy) return;
+  _arPollBusy = true;
+  try { await arPoll(); } finally { _arPollBusy = false; }
 }
 
 async function arPoll() {
@@ -2113,10 +2133,18 @@ async function openPreview() {
 
   // 미리보기 폴링 시작 (결과보기에서 변경한 것 감지)
   if (PV.pollTimer) clearInterval(PV.pollTimer);
-  PV.pollTimer = setInterval(pvPoll, 3000);
+  PV.pollTimer = setInterval(pvPollTick, 3000);
 }
 
 /* 미리보기 폴링 — 결과보기(ar-view)에서 변경한 compare_mode, preview_selected 감지 */
+// FIX-W2: 폴링 재진입 방지
+let _pvPollBusy = false;
+async function pvPollTick() {
+  if (_pvPollBusy) return;
+  _pvPollBusy = true;
+  try { await pvPoll(); } finally { _pvPollBusy = false; }
+}
+
 async function pvPoll() {
   if (!S.adminSess) return;
   const { data:sess } = await db.from('sessions')
@@ -2198,6 +2226,7 @@ async function renderPreviewChart() {
       data: DOMAINS.map(d => r.scores?.[d.id]||0),
       borderColor:sel.color, backgroundColor:`rgba(${rgb},.06)`,
       borderWidth:2, pointStyle:'circle', pointRadius:4,
+      borderDash:[5,3], // FIX-V1: 선택 참여자는 점선 — 결과보기와 동일
       pointBackgroundColor:sel.color,
     });
   });
