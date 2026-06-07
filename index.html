@@ -1014,6 +1014,18 @@ window.addEventListener('popstate', () => {
 window.addEventListener('beforeunload', e => {
   const cur = document.querySelector('.screen.on');
   if (cur && (cur.id==='s-survey'||cur.id==='s-waiting')) { e.preventDefault(); e.returnValue=''; }
+
+  // 관리자 세션 선택 중이면 토글 초기화 (페이지 닫힘/새로고침)
+  const sessId = S.adminSess?.id || (AR.session?.id);
+  if (sessId) {
+    const url = `${SUPABASE_URL}/rest/v1/sessions?id=eq.${sessId}`;
+    const body = JSON.stringify({compare_mode:'none', results_public:false, guide_public:false, preview_selected:''});
+    fetch(url, {
+      method:'PATCH', keepalive:true,
+      headers:{'Content-Type':'application/json','apikey':SUPABASE_KEY,'Authorization':'Bearer '+SUPABASE_KEY,'Prefer':'return=minimal'},
+      body
+    }).catch(()=>{});
+  }
 });
 
 /* ════════════════════════════════════════
@@ -1380,7 +1392,13 @@ async function submitAdminLogin() {
   show('s-admin');
 }
 
-function adminLogout() {
+async function adminLogout() {
+  // 결과보기 관련 토글 DB 초기화
+  if (S.adminSess) {
+    await db.from('sessions').update({
+      compare_mode:'none', results_public:false, guide_public:false, preview_selected:''
+    }).eq('id', S.adminSess.id);
+  }
   S.isAdmin = false;
   S.adminSess = null;
   document.getElementById('app').classList.remove('admin-mode');
@@ -1661,6 +1679,24 @@ async function initAdminResult(sessionId) {
   // 평균 미리 로드
   await arLoadAllAvg();
 
+  // DB에서 compare_mode 복원
+  const activeModes = (sess.compare_mode || 'none').split(',').filter(m => m && m !== 'none');
+  activeModes.forEach(m => { AR.layers[m] = true; });
+  document.querySelectorAll('.ar-pill[data-layer]').forEach(b => {
+    b.classList.toggle('on', AR.layers[b.dataset.layer]);
+  });
+
+  // DB에서 preview_selected 복원
+  const selStr = sess.preview_selected || '';
+  if (selStr) {
+    const selIds = selStr.split(',');
+    const rawColors = ['#F97316','#10B981','#6366F1'];
+    selIds.forEach((rid, ci) => {
+      const rIdx = AR.responses.findIndex(r => r.id === rid);
+      if (rIdx >= 0) AR.selected.push({idx: AR.responses[rIdx]._orig, color: rawColors[ci % 3]});
+    });
+  }
+
   arRenderAvgTable();
   arRenderParticipantTable();
   arRenderChart();
@@ -1700,16 +1736,22 @@ function calcGroupAvg(rows) {
   return avg;
 }
 
-/* 레이어 ON/OFF */
-function arToggleLayer(layer) {
+/* 레이어 ON/OFF → DB 동기화 */
+async function arToggleLayer(layer) {
   AR.layers[layer] = !AR.layers[layer];
   const btn = document.querySelector(`.ar-pill[data-layer="${layer}"]`);
   if (btn) btn.classList.toggle('on', AR.layers[layer]);
   arRenderChart();
+
+  // DB 동기화 — compare_mode 문자열 생성
+  const active = Object.keys(AR.layers).filter(k => AR.layers[k]);
+  const next = active.length ? active.join(',') : 'none';
+  await db.from('sessions').update({compare_mode:next}).eq('id', AR.session.id);
+  AR.session.compare_mode = next;
 }
 
-/* 참여자 선택 (최대 3명) */
-function arTogglePerson(idx) {
+/* 참여자 선택 (최대 3명) → DB 동기화 */
+async function arTogglePerson(idx) {
   const existingIdx = AR.selected.findIndex(s => s.idx === idx);
   if (existingIdx >= 0) {
     // 선택 해제
@@ -1724,6 +1766,14 @@ function arTogglePerson(idx) {
   arRenderParticipantTable();
   arUpdateSelectedPills();
   arRenderChart();
+
+  // DB 동기화 — 응답 ID로 변환하여 preview_selected 저장
+  if (AR.session) {
+    const selIds = AR.selected.map(s => AR.responses[s.idx]?.id).filter(Boolean);
+    const val = selIds.length ? selIds.join(',') : '';
+    await db.from('sessions').update({preview_selected:val}).eq('id', AR.session.id);
+    AR.session.preview_selected = val;
+  }
 }
 
 function arUpdateSelectedPills() {
@@ -1740,8 +1790,8 @@ function arUpdateSelectedPills() {
   }).join('');
 }
 
-/* 전체 해제 */
-function arResetAll() {
+/* 전체 해제 → DB 동기화 */
+async function arResetAll() {
   AR.layers   = { day:false, branch:false, total:false };
   AR.selected = [];
   AR.sortKeys = [{col:'num', asc:true}];
@@ -1750,6 +1800,13 @@ function arResetAll() {
   arUpdateSortHeaders();
   arRenderParticipantTable();
   arRenderChart();
+
+  // DB 동기화
+  if (AR.session) {
+    await db.from('sessions').update({compare_mode:'none', preview_selected:''}).eq('id', AR.session.id);
+    AR.session.compare_mode = 'none';
+    AR.session.preview_selected = '';
+  }
 }
 
 /* 차트 렌더 */
@@ -1918,19 +1975,45 @@ function arStartPolling() {
 async function arPoll() {
   if (!AR.session) return;
 
-  // 세션 상태 변경 확인
+  // 세션 상태 변경 확인 (preview_selected 포함)
   const { data:sess } = await db.from('sessions')
-    .select('compare_mode, guide_public, results_public')
+    .select('compare_mode, guide_public, results_public, preview_selected')
     .eq('id', AR.session.id).single();
   if (!sess) return;
 
-  const sessChanged =
-    sess.compare_mode    !== AR.session.compare_mode ||
-    sess.guide_public    !== AR.session.guide_public ||
-    sess.results_public  !== AR.session.results_public;
+  let needRender = false;
 
-  if (sessChanged) {
-    AR.session.compare_mode   = sess.compare_mode;
+  // compare_mode 변경 → AR.layers + 버튼 UI 갱신
+  if (sess.compare_mode !== AR.session.compare_mode) {
+    AR.session.compare_mode = sess.compare_mode;
+    const active = (sess.compare_mode || 'none').split(',').filter(m => m && m !== 'none');
+    AR.layers = { day: active.includes('day'), branch: active.includes('branch'), total: active.includes('total') };
+    document.querySelectorAll('.ar-pill[data-layer]').forEach(b => {
+      b.classList.toggle('on', AR.layers[b.dataset.layer]);
+    });
+    needRender = true;
+  }
+
+  // preview_selected 변경 → AR.selected 갱신
+  if ((sess.preview_selected || '') !== (AR.session.preview_selected || '')) {
+    AR.session.preview_selected = sess.preview_selected || '';
+    const selStr = AR.session.preview_selected;
+    AR.selected = [];
+    if (selStr) {
+      const selIds = selStr.split(',');
+      const rawColors = ['#F97316','#10B981','#6366F1'];
+      selIds.forEach((rid, ci) => {
+        const rIdx = AR.responses.findIndex(r => r.id === rid);
+        if (rIdx >= 0) AR.selected.push({idx: AR.responses[rIdx]._orig, color: rawColors[ci % 3]});
+      });
+    }
+    arUpdateSelectedPills();
+    arRenderParticipantTable();
+    needRender = true;
+  }
+
+  // guide_public, results_public 변경
+  if (sess.guide_public !== AR.session.guide_public || sess.results_public !== AR.session.results_public) {
     AR.session.guide_public   = sess.guide_public;
     AR.session.results_public = sess.results_public;
   }
@@ -1949,11 +2032,11 @@ async function arPoll() {
         `${AR.session.session_date} · ${AR.responses.length}명 참여`;
       arRenderAvgTable();
       arRenderParticipantTable();
-      arRenderChart();
+      needRender = true;
     }
-  } else if (sessChanged) {
-    arRenderChart();
   }
+
+  if (needRender) arRenderChart();
 }
 
 /* ════════════════════════════════════════
