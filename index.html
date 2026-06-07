@@ -614,6 +614,7 @@ body { font-family:var(--font); color:var(--t1); -webkit-font-smoothing:antialia
       <button id="btn-sess-tog" class="ctrl-act-btn ctrl-act-off" onclick="handleSessToggle()">시작</button>
       <button id="btn-results"  class="ctrl-act-btn ctrl-act-off" onclick="toggleResults()">결과 공개</button>
       <button id="btn-result-view" class="ctrl-act-btn ctrl-act-link" onclick="openCurrentSessionResult()">결과보기↗</button>
+      <button class="ctrl-act-btn ctrl-act-link" onclick="copyResultUrl()" style="font-size:11px">URL복사</button>
       <button id="btn-guide-pub" class="ctrl-act-btn ctrl-act-off" onclick="toggleGuide()">해석 공개</button>
     </div>
     <!-- 참여자 화면 미리보기 버튼 -->
@@ -1529,6 +1530,22 @@ function backToSessList() {
 function openCurrentSessionResult() {
   if (!S.adminSess) return;
   openSessionResult(S.adminSess.id);
+}
+
+function copyResultUrl() {
+  if (!S.adminSess) { toast('세션을 먼저 선택해주세요'); return; }
+  const base = location.origin + location.pathname;
+  const url = `${base}?view=admin-result&session=${S.adminSess.id}`;
+  navigator.clipboard.writeText(url).then(() => {
+    toast('결과보기 URL이 복사되었습니다');
+  }).catch(() => {
+    // clipboard API 실패 시 fallback
+    const ta = document.createElement('textarea');
+    ta.value = url; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('결과보기 URL이 복사되었습니다');
+  });
 }
 
 /* 참여자 목록 접기/펼치기 */
